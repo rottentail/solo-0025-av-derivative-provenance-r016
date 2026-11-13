@@ -172,11 +172,14 @@ Steps:
 
 1. The application loads a completed rendition and its provenance edge.
 2. The verifier loads both parent assets and the recorded output.
-3. The executor repeats the stored normalized plan.
-4. The verifier compares reproduced bytes and media descriptors with the
+3. Every parent blob is re-read in full and its SHA-256 compared with the
+   immutable asset record before any replay (`source_digest_drift` on failure).
+4. The verifier loads the recorded output and confirms its digest as well.
+5. The executor repeats the stored normalized plan as a full replay.
+6. The verifier compares reproduced bytes and media descriptors with the
    recorded output.
-5. The repository persists the integrity result.
-6. The HTTP boundary returns the result.
+7. The repository persists the integrity result.
+8. The HTTP boundary returns the result.
 
 Success:
 
@@ -186,8 +189,30 @@ Failure:
 
 - A completed rendition must exist, otherwise `404`.
 - Parent or output loss yields `mismatch`.
-- Digest or descriptor drift yields `409 INTEGRITY_MISMATCH` while retaining
-  the persisted mismatch check.
+- Whole-source digest drift, replay digest, or descriptor drift yields
+  `409 INTEGRITY_MISMATCH` while retaining the persisted mismatch check.
+
+### Ranged local reads
+
+Renditions whose normalized plan starts with `media_trim` and whose remaining
+operations are all pointwise or window-local are served by a ranged read path
+instead of loading the whole source:
+
+- Eligibility is decided by `renditions/locality.py`. A secondary asset
+  (`audio_mix`) or any whole-clip statistic computed before the trim
+  (for example `audio_normalize` then `media_trim`) forces the full path.
+- `storage/content_files.py` opens a seekable, byte-counted `FileMediaSource`;
+  the blob is never fully buffered for an eligible rendition.
+- The media module probes WAV/Y4M headers only and decodes the exact trim
+  window via `wav.probe_wav`/`decode_wav_range` and
+  `y4m.probe_y4m`/`decode_y4m_range`.
+- Local and full paths share the same operation functions, so a local render
+  is byte-identical to full execution. No decoded source content is cached.
+- Any layout the ranged parser cannot prove equivalent raises
+  `LocalReadUnavailable`; the application then runs the unchanged full
+  read-and-decode path. Observable acceptance and error codes do not change.
+- The ranged path only endorses bytes inside its window. Whole-source health
+  remains the exclusive responsibility of the integrity check above.
 
 ## Supported media operations
 
@@ -214,11 +239,11 @@ turn into partial output.
 | Module ID | Path | Responsibility |
 | --- | --- | --- |
 | `http_api` | `avprovenance/http_api.py` | HTTP routes, body limits, status mapping |
-| `application` | `avprovenance/application.py` | Use-case orchestration and public contract |
+| `application` | `avprovenance/application.py` | Use-case orchestration, local/full routing, whole-source audits |
 | `validation` | `avprovenance/validation.py` | Request and operation boundary checks |
-| `media` | `avprovenance/media` | WAV/Y4M inspection and byte operations |
-| `renditions` | `avprovenance/renditions` | Plan normalization, execution, verification |
-| `storage` | `avprovenance/storage` | Atomic state, blobs, and repository methods |
+| `media` | `avprovenance/media` | WAV/Y4M inspection, full and ranged byte operations |
+| `renditions` | `avprovenance/renditions` | Plan normalization, locality analysis, execution, verification |
+| `storage` | `avprovenance/storage` | Atomic state, ranged and full blob access, repository methods |
 
 Dependency direction:
 

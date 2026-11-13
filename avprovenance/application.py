@@ -17,10 +17,12 @@ from .models import (
     ProvenanceEdge,
     Rendition,
 )
-from .media import inspect_media
+from .media import LocalReadUnavailable, inspect_media
 from .renditions import (
     compile_plan,
     execute_plan,
+    execute_plan_local,
+    plan_is_locally_readable,
     reproduce_output,
 )
 from .serialization import (
@@ -153,13 +155,39 @@ class MediaProvenanceApplication:
         self.repository.transition_rendition(rendition.id, "running")
 
         try:
-            primary_bytes = self._asset_bytes(primary)
-            secondary_bytes = self._asset_bytes(secondary) if secondary else None
-            outcome = execute_plan(
-                primary_bytes,
+            local_ready = plan_is_locally_readable(
+                primary.kind,
                 plan.operations,
-                secondary_bytes,
+                has_secondary=secondary is not None,
             )
+            if local_ready:
+                # Ranged path: the blob stays on disk and the parsers fetch
+                # only the header plus the trimmed window. Any layout the
+                # ranged parser cannot prove equivalent falls back to the
+                # exact full-read path below instead of failing the request.
+                source = self.content_files.open_source(primary.content_key)
+                try:
+                    try:
+                        outcome = execute_plan_local(source, plan.operations)
+                    except LocalReadUnavailable:
+                        outcome = None
+                finally:
+                    source.close()
+                if outcome is None:
+                    primary_bytes = self._asset_bytes(primary)
+                    outcome = execute_plan(
+                        primary_bytes,
+                        plan.operations,
+                        None,
+                    )
+            else:
+                primary_bytes = self._asset_bytes(primary)
+                secondary_bytes = self._asset_bytes(secondary) if secondary else None
+                outcome = execute_plan(
+                    primary_bytes,
+                    plan.operations,
+                    secondary_bytes,
+                )
             output_digest = sha256_hex(outcome.data)
             output_key = self.content_files.key_for_digest(output_digest)
             output_existed = self.content_files.exists(output_key)
@@ -298,6 +326,30 @@ class MediaProvenanceApplication:
             self._finish_mismatch(
                 audit,
                 "source_or_output_unavailable",
+                expected_digest=output_asset.sha256,
+                expected_descriptor=expected_descriptor,
+            )
+
+        # Independent whole-source cross-check. The ranged render path only
+        # reads the trimmed window, so a rendition succeeding must never be
+        # taken as evidence that the rest of the source blob is intact. The
+        # audit re-reads every parent in full and compares its digest against
+        # the immutable asset record before trusting any replay.
+        source_pairs = [(primary_asset, primary_bytes)]
+        if secondary_asset is not None:
+            source_pairs.append((secondary_asset, secondary_bytes))
+        for parent_asset, parent_bytes in source_pairs:
+            if sha256_hex(parent_bytes) != parent_asset.sha256:
+                self._finish_mismatch(
+                    audit,
+                    "source_digest_drift",
+                    expected_digest=output_asset.sha256,
+                    expected_descriptor=expected_descriptor,
+                )
+        if sha256_hex(recorded_output) != output_asset.sha256:
+            self._finish_mismatch(
+                audit,
+                "recorded_output_digest_drift",
                 expected_digest=output_asset.sha256,
                 expected_descriptor=expected_descriptor,
             )

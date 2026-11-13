@@ -4,10 +4,77 @@ from __future__ import annotations
 
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..errors import PersistenceFailure
 from ..serialization import sha256_hex
+
+
+@dataclass
+class FileMediaSource:
+    """Seekable, byte-counted handle over one content-addressed blob.
+
+    It implements the structural ``MediaByteSource`` protocol without the
+    storage layer importing the media layer. Only explicit ranged reads touch
+    the disk, and unique bytes served are counted so callers can prove that
+    short trims no longer pull an entire source through memory.
+    """
+
+    path: Path
+    _size: int
+    _ranges: list[tuple[int, int]]
+    _read_calls: int = 0
+
+    @classmethod
+    def open(cls, path: Path) -> "FileMediaSource":
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise PersistenceFailure("A referenced media file is missing.") from exc
+        return cls(path=path, _size=size, _ranges=[])
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    @property
+    def bytes_read(self) -> int:
+        if not self._ranges:
+            return 0
+        merged = sorted(self._ranges)
+        total = 0
+        current_start, current_end = merged[0]
+        for start, end in merged[1:]:
+            if start <= current_end:
+                if end > current_end:
+                    current_end = end
+            else:
+                total += current_end - current_start
+                current_start, current_end = start, end
+        total += current_end - current_start
+        return total
+
+    @property
+    def read_calls(self) -> int:
+        return self._read_calls
+
+    def read_range(self, offset: int, length: int) -> bytes:
+        if offset < 0 or length < 0 or offset > self._size:
+            raise PersistenceFailure("A media source range is outside the blob.")
+        self._read_calls += 1
+        end = min(self._size, offset + length)
+        try:
+            with open(self.path, "rb") as handle:
+                handle.seek(offset)
+                data = handle.read(end - offset)
+        except OSError as exc:
+            raise PersistenceFailure("A referenced media file is unreadable.") from exc
+        self._ranges.append((offset, offset + len(data)))
+        return data
+
+    def close(self) -> None:
+        return None
 
 
 class ContentFileRepository:
@@ -32,6 +99,10 @@ class ContentFileRepository:
         except ValueError as exc:
             raise PersistenceFailure("A content key escapes the data root.") from exc
         return candidate
+
+    def open_source(self, key: str) -> FileMediaSource:
+        """Open a ranged, byte-counted source without loading the whole blob."""
+        return FileMediaSource.open(self._path_for_key(key))
 
     def write(self, data: bytes, digest: str) -> str:
         if sha256_hex(data) != digest:

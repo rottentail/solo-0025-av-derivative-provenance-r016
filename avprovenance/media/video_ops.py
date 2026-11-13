@@ -5,24 +5,41 @@ from __future__ import annotations
 from typing import Any
 
 from .errors import MediaOperationFailure
-from .y4m import Y4mClip, Y4mFrame, decode_y4m, encode_y4m
+from .source import MediaByteSource
+from .y4m import (
+    Y4mClip,
+    Y4mFrame,
+    decode_y4m,
+    decode_y4m_range,
+    encode_y4m,
+    probe_y4m,
+)
 
 
-def trim_video(clip: Y4mClip, operation: dict[str, Any]) -> Y4mClip:
+def video_trim_window(
+    frame_count: int,
+    operation: dict[str, Any],
+) -> tuple[int, int]:
+    """Return the validated ``[start, end)`` frame window for both render paths."""
     start = int(operation["start_frame"])
     count = int(operation["frame_count"])
-    if start < 0 or start >= clip.frame_count:
+    if start < 0 or start >= frame_count:
         raise MediaOperationFailure(
             "VIDEO_TRIM_OUT_OF_RANGE",
             "The requested video trim starts outside the source.",
         )
-    end = min(clip.frame_count, start + max(1, count))
-    frames = clip.frames[start:end]
-    if not frames:
+    end = min(frame_count, start + max(1, count))
+    if end <= start:
         raise MediaOperationFailure(
             "VIDEO_TRIM_EMPTY",
             "The requested video trim produces no frames.",
         )
+    return start, end
+
+
+def trim_video(clip: Y4mClip, operation: dict[str, Any]) -> Y4mClip:
+    start, end = video_trim_window(clip.frame_count, operation)
+    frames = clip.frames[start:end]
     return Y4mClip(
         width=clip.width,
         height=clip.height,
@@ -181,6 +198,28 @@ def render_video(
             "The current video operation set accepts one source.",
         )
     clip = decode_y4m(primary_bytes)
+    clip = apply_video_operations(clip, operations)
+    return encode_y4m(clip)
+
+
+# Every supported video operation is pointwise or window-local: crop, luma
+# offset, and mirror inspect only the frame they output, so a leading trim can
+# be pushed down into the read layer.
+LOCAL_VIDEO_OPERATIONS = frozenset(
+    {
+        "media_trim",
+        "video_crop",
+        "video_luma_offset",
+        "video_mirror",
+    }
+)
+
+
+def apply_video_operations(
+    clip: Y4mClip,
+    operations: list[dict[str, Any]],
+) -> Y4mClip:
+    """Apply a normalized video plan to an already-decoded clip."""
     try:
         for operation in operations:
             operation_type = operation["type"]
@@ -202,4 +241,16 @@ def render_video(
             "VIDEO_OPERATION_INVALID",
             "The video operation payload is malformed.",
         ) from exc
+    return clip
+
+
+def render_video_local(
+    source: MediaByteSource,
+    operations: list[dict[str, Any]],
+) -> bytes:
+    """Render an eligible plan while decoding only the first trim window."""
+    layout = probe_y4m(source)
+    start, end = video_trim_window(layout.frame_count, operations[0])
+    clip = decode_y4m_range(source, layout, start, end - start)
+    clip = apply_video_operations(clip, operations[1:])
     return encode_y4m(clip)

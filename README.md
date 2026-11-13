@@ -19,6 +19,45 @@ FFmpeg, network access, credentials, or an online database.
 - Replays the stored operation plan and compares both bytes and media
   descriptors.
 
+## Ranged local reads for short selections
+
+When a plan begins with `media_trim` and every later operation is pointwise or
+window-local (audio gain/normalization, video crop/luma/mirror), the executor
+does not load the whole source blob. It opens a byte-counted ranged source,
+probes only the container header, and decodes just the frames or sample frames
+inside the trim window. The source bytes read and the processing work therefore
+shrink in proportion to the delivered selection rather than the full asset.
+
+Plans that genuinely need whole-clip state are never misclassified:
+
+- `audio_normalize` (or any other operation) appearing *before* the trim stays
+  on the full path, because its peak is computed over the entire source.
+- `audio_mix` always stays on the full path because it reads the full-length
+  secondary asset.
+- A leading trim is required; plans without one use the unchanged full path.
+
+If a ranged parser cannot prove its layout is equivalent to the full parser
+(truncated payload, variable frame headers, unexpected RIFF layout), it raises
+an internal `LocalReadUnavailable` signal and the request transparently falls
+back to the full read-and-decode path. No plan becomes newly rejectable, and
+the local path shares the exact same per-operation functions, so output bytes
+are identical to full execution. No decoded source content is cached.
+
+The integrity check remains independent of this optimization: it re-reads every
+parent asset in full, verifies each whole-source SHA-256 against the immutable
+asset record (`source_digest_drift` on failure), and only then performs a real
+full replay of the stored plan. A short clip rendering successfully never
+endorses bytes outside its window.
+
+Two scripts demonstrate and verify the behavior:
+
+```bash
+# Byte-identity, locality/fallback rules, and independent audit behavior
+python3 -I scripts/local_read_checks.py
+# Near-24 MiB WAV/Y4M fixtures with byte and wall-time savings for short clips
+python3 -I scripts/local_read_benefit_demo.py
+```
+
 ## Quick start
 
 ```bash
@@ -199,7 +238,10 @@ python3 scripts/workflow_checks.py verify-reproduction
 ```
 
 Each check starts a temporary HTTP server, generates media bytes in memory,
-exercises the public endpoints, and shuts the server down.
+exercises the public endpoints, and shuts the server down. The
+`local_read_checks.py` and `local_read_benefit_demo.py` scripts provide
+additional differential and measurement coverage for the ranged read path but
+are not part of the deferred baseline suite.
 
 ## Environment
 

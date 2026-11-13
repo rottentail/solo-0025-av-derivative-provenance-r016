@@ -6,7 +6,15 @@ import math
 from typing import Any
 
 from .errors import MediaOperationFailure
-from .wav import AudioClip, decode_wav, encode_wav, replace_channels
+from .source import MediaByteSource
+from .wav import (
+    AudioClip,
+    decode_wav,
+    decode_wav_range,
+    encode_wav,
+    probe_wav,
+    replace_channels,
+)
 
 
 PCM_MIN = -32768
@@ -25,20 +33,34 @@ def _gain_factor(db: float) -> float:
     return math.pow(10.0, float(db) / 20.0)
 
 
-def trim_audio(clip: AudioClip, operation: dict[str, Any]) -> AudioClip:
-    start = int(round(float(operation["start_seconds"]) * clip.sample_rate))
-    duration = int(round(float(operation["duration_seconds"]) * clip.sample_rate))
-    if start < 0 or start >= clip.frame_count:
+def audio_trim_window(
+    frame_count: int,
+    sample_rate: int,
+    operation: dict[str, Any],
+) -> tuple[int, int]:
+    """Return the validated ``[start, end)`` window shared by both render paths."""
+    start = int(round(float(operation["start_seconds"]) * sample_rate))
+    duration = int(round(float(operation["duration_seconds"]) * sample_rate))
+    if start < 0 or start >= frame_count:
         raise MediaOperationFailure(
             "AUDIO_TRIM_OUT_OF_RANGE",
             "The requested audio trim starts outside the source.",
         )
-    end = min(clip.frame_count, start + max(1, duration))
+    end = min(frame_count, start + max(1, duration))
     if end <= start:
         raise MediaOperationFailure(
             "AUDIO_TRIM_EMPTY",
             "The requested audio trim produces no sample frames.",
         )
+    return start, end
+
+
+def trim_audio(clip: AudioClip, operation: dict[str, Any]) -> AudioClip:
+    start, end = audio_trim_window(
+        clip.frame_count,
+        clip.sample_rate,
+        operation,
+    )
     return replace_channels(clip, (values[start:end] for values in clip.channels))
 
 
@@ -113,8 +135,32 @@ def render_audio(
 ) -> bytes:
     clip = decode_wav(primary_bytes)
     secondary = decode_wav(secondary_bytes) if secondary_bytes is not None else None
-    mixed = False
+    clip = apply_audio_operations(clip, operations, secondary)
+    return encode_wav(clip)
 
+
+# Operations that can be evaluated on the post-trim window alone. Mixing is
+# excluded because it depends on the full-length secondary source.
+LOCAL_AUDIO_OPERATIONS = frozenset(
+    {
+        "media_trim",
+        "audio_gain",
+        "audio_normalize",
+    }
+)
+
+
+def apply_audio_operations(
+    clip: AudioClip,
+    operations: list[dict[str, Any]],
+    secondary: AudioClip | None,
+) -> AudioClip:
+    """Apply a normalized audio plan to an already-decoded clip.
+
+    Both the full and the ranged render paths use this dispatcher, which keeps
+    their per-operation arithmetic byte-identical.
+    """
+    mixed = False
     try:
         for operation in operations:
             operation_type = operation["type"]
@@ -147,5 +193,20 @@ def render_audio(
             "AUDIO_OPERATION_INVALID",
             "The audio operation payload is malformed.",
         ) from exc
+    return clip
 
+
+def render_audio_local(
+    source: MediaByteSource,
+    operations: list[dict[str, Any]],
+) -> bytes:
+    """Render an eligible plan while decoding only the first trim window."""
+    layout = probe_wav(source)
+    start, end = audio_trim_window(
+        layout.frame_count,
+        layout.sample_rate,
+        operations[0],
+    )
+    clip = decode_wav_range(source, layout, start, end - start)
+    clip = apply_audio_operations(clip, operations[1:], None)
     return encode_wav(clip)

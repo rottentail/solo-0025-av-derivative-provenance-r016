@@ -270,6 +270,38 @@ def run_execute_rendition(client: HTTPClient) -> dict[str, Any]:
     require_equal(properties["width"], 32, "video output width")
     require_equal(properties["height"], 18, "video output height")
 
+    # Leading-trim plans exercise the ranged local read path end to end while
+    # producing a regular completed rendition.
+    trim_wav = make_wav(frequency=660, duration_seconds=0.5)
+    trim_asset = client.upload("trim-source.wav", trim_wav)
+    trim_rendition = client.create_rendition(
+        {
+            "primary_asset_id": trim_asset["id"],
+            "output_name": "trim-window.wav",
+            "operations": [
+                {
+                    "type": "media_trim",
+                    "start_seconds": 0.1,
+                    "duration_seconds": 0.2,
+                },
+                {"type": "audio_gain", "db": -4},
+                {"type": "audio_normalize", "target_peak": 0.8},
+            ],
+        }
+    )
+    require_equal(
+        trim_rendition["status"],
+        "completed",
+        "ranged audio rendition status",
+    )
+    trim_check_status, trim_check = client.request(
+        "POST",
+        f"/v1/renditions/{trim_rendition['id']}/integrity-checks",
+        {},
+    )
+    require_equal(trim_check_status, 201, "ranged rendition audit status")
+    require_equal(trim_check["status"], "verified", "ranged rendition audit")
+
     lineage_status, lineage = client.request(
         "GET",
         f"/v1/renditions/{audio_rendition['id']}/lineage",
